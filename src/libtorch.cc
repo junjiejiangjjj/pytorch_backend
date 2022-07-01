@@ -508,6 +508,9 @@ class ModelInstanceState : public BackendModelInstance {
 
   // If the input to the tensor is a dictionary of tensors.
   bool is_dict_input_;
+
+  // If the model supports batching.
+  bool supports_batching_;
 };
 
 TRITONSERVER_Error*
@@ -580,6 +583,7 @@ ModelInstanceState::ModelInstanceState(
       expected_input_cnt += 1;
     }
   }
+  supports_batching_ = model_state_->MaxBatchSize() > 0;
 
   THROW_IF_BACKEND_INSTANCE_ERROR(ValidateInputs(expected_input_cnt));
   THROW_IF_BACKEND_INSTANCE_ERROR(ValidateOutputs());
@@ -755,7 +759,6 @@ ModelInstanceState::ValidateInputs(const size_t expected_input_cnt)
         "specified.");
   }
 
-  bool supports_batching = model_state_->MaxBatchSize() > 0;
   NamingConvention naming_convention;
   RETURN_IF_ERROR(GetNamingConvention(&naming_convention, allowed_inputs));
 
@@ -817,7 +820,7 @@ ModelInstanceState::ValidateInputs(const size_t expected_input_cnt)
         RETURN_IF_ERROR(ParseShape(io, "dims", &dims));
       }
 
-      if ((dims.size() + (supports_batching ? 1 : 0)) > 1) {
+      if ((dims.size() + (supports_batching_ ? 1 : 0)) > 1) {
         return TRITONSERVER_ErrorNew(
             TRITONSERVER_ERROR_INTERNAL,
             ("Triton only supports 1 dimensional List of String as input for "
@@ -847,7 +850,6 @@ ModelInstanceState::ValidateOutputs()
         "specified.");
   }
 
-  const bool supports_batching = model_state_->MaxBatchSize() > 0;
   NamingConvention naming_convention;
   RETURN_IF_ERROR(GetNamingConvention(&naming_convention, {}));
 
@@ -896,7 +898,7 @@ ModelInstanceState::ValidateOutputs()
         RETURN_IF_ERROR(ParseShape(io, "dims", &dims));
       }
 
-      if ((dims.size() + (supports_batching ? 1 : 0)) > 1) {
+      if ((dims.size() + (supports_batching_ ? 1 : 0)) > 1) {
         return TRITONSERVER_ErrorNew(
             TRITONSERVER_ERROR_INTERNAL,
             ("Triton only supports 1 dimensional List of String as output for "
@@ -1482,9 +1484,8 @@ bool
 SetStringInputTensor(
     torch::List<std::string>* input_list, TRITONBACKEND_Input* input,
     const char* name, const uint32_t buffer_count,
-    const size_t request_element_cnt, const size_t tensor_offset,
-    TRITONBACKEND_Response** response, cudaStream_t stream,
-    const char* host_policy_name)
+    const size_t request_element_cnt, TRITONBACKEND_Response** response,
+    cudaStream_t stream, const char* host_policy_name)
 {
   bool cuda_copy = false;
   size_t element_idx = 0;
@@ -1577,7 +1578,7 @@ bool
 SetStringOutputBuffer(
     torch::List<torch::jit::IValue>* tensor, TRITONBACKEND_Response** response,
     TRITONBACKEND_Output* response_output, const size_t tensor_element_count,
-    const size_t tensor_offset, cudaStream_t stream, std::string* serialized)
+    cudaStream_t stream, std::string* serialized)
 {
   bool cuda_copy = false;
 
@@ -1634,8 +1635,6 @@ ModelInstanceState::SetInputTensors(
     std::vector<torch::jit::IValue>* input_tensors,
     std::vector<BackendMemory*>* input_memories, bool* cuda_copy)
 {
-  const int max_batch_size = model_state_->MaxBatchSize();
-
   // InferenceMode should be used to guard all tensors operations
   torch::InferenceMode infer_guard(model_state_->EnabledInferenceMode());
 
@@ -1662,7 +1661,7 @@ ModelInstanceState::SetInputTensors(
     // The shape for the entire input patch, [total_batch_size, ...]
     std::vector<int64_t> batchn_shape(
         input_shape, input_shape + input_dims_count);
-    if (max_batch_size != 0) {
+    if (supports_batching_) {
       batchn_shape[0] = total_batch_size;
     }
 
@@ -1696,8 +1695,6 @@ ModelInstanceState::SetInputTensors(
       torch::List<std::string> input_list;
       input_list.reserve(batchn_shape[0]);
 
-      size_t tensor_offset = 0;
-
       for (size_t idx = 0; idx < request_count; idx++) {
         TRITONBACKEND_Input* input;
         RESPOND_AND_SET_NULL_IF_ERROR(
@@ -1716,9 +1713,7 @@ ModelInstanceState::SetInputTensors(
 
         *cuda_copy |= SetStringInputTensor(
             &input_list, input, input_name, buffer_count, batch_element_cnt,
-            tensor_offset, &((*responses)[idx]), CudaStream(),
-            HostPolicyName().c_str());
-        tensor_offset += batch_element_cnt;
+            &((*responses)[idx]), CudaStream(), HostPolicyName().c_str());
       }
 
       (*input_tensors)[input_index_map_[input_name]] = input_list;
@@ -1813,21 +1808,17 @@ ModelInstanceState::ReadOutputTensors(
 
     } else if (output_tensors[op_index].isList()) {
       // Custom handling for string/bytes tensor...
-      const int max_batch_size = model_state_->MaxBatchSize();
-
       torch::List<torch::jit::IValue> output_list =
           output_tensors[op_index].toList();
 
       // Get output shape
       std::vector<int64_t> batchn_shape{(int64_t)output_list.size()};
 
-      size_t tensor_offset = 0;
-
       for (size_t idx = 0; idx < responses->size(); idx++) {
         auto& request = requests[idx];
         auto& response = (*responses)[idx];
 
-        if (max_batch_size != 0) {
+        if (supports_batching_ != 0) {
           TRITONBACKEND_Input* input;
           TRITONBACKEND_RequestInputByIndex(request, 0 /* index*/, &input);
           const int64_t* shape;
@@ -1849,10 +1840,8 @@ ModelInstanceState::ReadOutputTensors(
           string_buffer.emplace_back(new std::string());
           cuda_copy |= SetStringOutputBuffer(
               &output_list, &response, response_output, tensor_element_cnt,
-              tensor_offset, CudaStream(), string_buffer.back().get());
+              CudaStream(), string_buffer.back().get());
         }
-
-        tensor_offset += tensor_element_cnt;
       }
     } else {
       return TRITONSERVER_ErrorNew(
